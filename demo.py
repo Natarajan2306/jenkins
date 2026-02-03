@@ -9,6 +9,7 @@ Environment Variables Required:
 - JENKINS_API_TOKEN: Jenkins API token
 - FLASK_PORT: (optional) Port to run on, default 5000
 - FLASK_DEBUG: (optional) Enable debug mode, default False
+- JENKINS_TIMEOUT: (optional) Jenkins request timeout in seconds, default 60
 """
 
 from flask import Flask, request, jsonify
@@ -37,6 +38,7 @@ JENKINS_USER = os.environ.get("JENKINS_USER")
 JENKINS_API_TOKEN = os.environ.get("JENKINS_API_TOKEN")
 FLASK_PORT = int(os.environ.get("FLASK_PORT", "5000"))
 FLASK_DEBUG = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
+JENKINS_TIMEOUT = int(os.environ.get("JENKINS_TIMEOUT", "60"))  # Default 60 seconds
 
 # Validate required environment variables
 if not all([JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN]):
@@ -48,6 +50,8 @@ if not all([JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN]):
 @app.route("/", methods=["GET"])
 def health_check():
     """Health check endpoint"""
+    # Minimal logging for healthchecks to reduce log noise
+    logger.debug("Health check requested")
     return jsonify({
         "status": "healthy",
         "service": "gmail-jenkins-webhook",
@@ -156,7 +160,7 @@ def trigger_jenkins_job(email_data):
             auth=(JENKINS_USER, JENKINS_API_TOKEN),
             headers=headers,
             # json=params,  # Uncomment to pass parameters
-            timeout=10
+            timeout=JENKINS_TIMEOUT
         )
         
         # Check response
@@ -221,10 +225,50 @@ def test_endpoint():
 @app.before_request
 def log_request_info():
     """Log all incoming requests for debugging"""
+    # Skip verbose logging for healthcheck requests
+    if request.path == "/" and request.method == "GET":
+        logger.debug(f"Healthcheck: {request.method} {request.path}")
+        return
+    
     logger.info(f"Incoming request: {request.method} {request.path}")
+    logger.info(f"Request URL: {request.url}")
+    logger.info(f"Request base URL: {request.base_url}")
     logger.info(f"Headers: {dict(request.headers)}")
     if request.is_json:
-        logger.info(f"JSON payload: {request.get_json()}")
+        try:
+            logger.info(f"JSON payload: {request.get_json()}")
+        except:
+            logger.warning("Could not parse JSON payload")
+
+
+@app.errorhandler(404)
+def not_found(e):
+    """Handle 404 errors with detailed logging"""
+    logger.error(f"404 Not Found: {request.method} {request.path}")
+    logger.error(f"Request URL: {request.url}")
+    logger.error(f"Request base URL: {request.base_url}")
+    logger.error(f"Request script root: {request.script_root}")
+    logger.error(f"Request path: {request.path}")
+    logger.error(f"Request URL root: {request.url_root}")
+    
+    # List all registered routes for debugging
+    routes = []
+    for rule in app.url_map.iter_rules():
+        routes.append({
+            "endpoint": rule.endpoint,
+            "methods": list(rule.methods),
+            "path": str(rule)
+        })
+    logger.error(f"Available routes: {routes}")
+    
+    return jsonify({
+        "error": "Not found",
+        "method": request.method,
+        "path": request.path,
+        "url": request.url,
+        "available_routes": routes,
+        "message": f"Route {request.path} not found"
+    }), 404
 
 
 @app.errorhandler(405)
@@ -240,16 +284,52 @@ def method_not_allowed(e):
     }), 405
 
 
+@app.route("/routes", methods=["GET"])
+def list_routes():
+    """List all registered routes for debugging"""
+    routes = []
+    for rule in app.url_map.iter_rules():
+        routes.append({
+            "endpoint": rule.endpoint,
+            "methods": list(rule.methods),
+            "path": str(rule)
+        })
+    return jsonify({
+        "routes": routes,
+        "total": len(routes)
+    })
+
+
+# Log registered routes on startup (works with gunicorn)
+# This will be called after all routes are registered
+def log_startup_info():
+    """Log startup information including registered routes"""
+    logger.info("=" * 50)
+    logger.info("Flask App Initialized")
+    logger.info(f"Jenkins URL: {JENKINS_URL}")
+    logger.info(f"Jenkins User: {JENKINS_USER}")
+    logger.info("Registered routes:")
+    for rule in app.url_map.iter_rules():
+        logger.info(f"  {list(rule.methods)} {rule}")
+    logger.info("=" * 50)
+
+
 if __name__ == "__main__":
     logger.info("=" * 50)
     logger.info("Gmail-Jenkins Webhook Server Starting")
     logger.info(f"Jenkins URL: {JENKINS_URL}")
     logger.info(f"Jenkins User: {JENKINS_USER}")
     logger.info(f"Listening on port: {FLASK_PORT}")
-    logger.info("=" * 50)
+    log_startup_info()
     
     app.run(
         host="0.0.0.0",
         port=FLASK_PORT,
         debug=FLASK_DEBUG
     )
+# When imported by gunicorn, log startup info
+# Routes are registered via decorators, so they're available at import time
+try:
+    log_startup_info()
+except Exception as e:
+    logger.warning(f"Could not log startup info: {e}")
