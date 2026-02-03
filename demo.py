@@ -1,200 +1,215 @@
-from flask import Flask, jsonify
-import imaplib
-import email
-import requests
-import threading
-import time
-import urllib.parse
+"""
+Flask Webhook Server - Gmail to Jenkins Bridge
 
+This receives webhooks from Google Apps Script and triggers Jenkins jobs.
+
+Environment Variables Required:
+- JENKINS_URL: Full Jenkins job build URL
+- JENKINS_USER: Jenkins username
+- JENKINS_API_TOKEN: Jenkins API token
+- FLASK_PORT: (optional) Port to run on, default 5000
+- FLASK_DEBUG: (optional) Enable debug mode, default False
+"""
+
+from flask import Flask, request, jsonify
+import requests
+import os
+import logging
+from datetime import datetime
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Initialize Flask app
 app = Flask(__name__)
 
-# ========== YOUR SETTINGS (ALL CONFIGURED) ==========
-GMAIL_EMAIL = 'natarajan@pdevsecops.com'
-GMAIL_APP_PASSWORD = 'gkqlnyojggevgnhd'  # Spaces removed
-JENKINS_URL = 'http://localhost:8080'
-JENKINS_USER = 'admin'
-JENKINS_TOKEN = '1154319e687396663934958c01737c99b9'
-JOB_NAME = 'pre-sign up automations'
+# Load configuration from environment variables
+JENKINS_URL = os.environ.get("JENKINS_URL")
+JENKINS_USER = os.environ.get("JENKINS_USER")
+JENKINS_API_TOKEN = os.environ.get("JENKINS_API_TOKEN")
+FLASK_PORT = int(os.environ.get("FLASK_PORT", "5000"))
+FLASK_DEBUG = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
 
-# Trigger words in subject
-TRIGGER_SUBJECTS = ['START JENKINS', 'DEPLOY NOW', 'RUN BUILD', 'TRIGGER', 'PRE-SIGN UP']
-# ====================================================
+# Validate required environment variables
+if not all([JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN]):
+    logger.error("Missing required environment variables!")
+    logger.error("Required: JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN")
+    exit(1)
 
-monitoring = True
 
-def trigger_jenkins():
-    """Trigger Jenkins job"""
-    # URL encode job name (handles spaces)
-    encoded_job = urllib.parse.quote(JOB_NAME, safe='')
-    url = f"{JENKINS_URL}/job/{encoded_job}/build"
-    
-    try:
-        print(f"   🚀 Calling: {url}")
-        response = requests.post(url, auth=(JENKINS_USER, JENKINS_TOKEN), timeout=10)
-        
-        if response.status_code == 201:
-            print("   ✅ Jenkins job 'pre-sign up automations' triggered successfully!")
-            return True
-        elif response.status_code == 404:
-            print(f"   ❌ Job not found! Check job name in Jenkins")
-            print(f"   💡 Make sure job exists: {JENKINS_URL}/job/{encoded_job}")
-            return False
-        elif response.status_code == 403:
-            print(f"   ❌ Permission denied! Check your token")
-            return False
-        else:
-            print(f"   ❌ Jenkins failed: Status {response.status_code}")
-            print(f"   Response: {response.text}")
-            return False
-    except Exception as e:
-        print(f"   ❌ Error: {e}")
-        return False
-
-def check_latest_email(mail):
-    """Check the most recent email"""
-    try:
-        # Get the latest email
-        status, messages = mail.search(None, 'ALL')
-        email_ids = messages[0].split()
-        
-        if not email_ids:
-            return
-        
-        latest_id = email_ids[-1]
-        
-        # Fetch it
-        status, msg_data = mail.fetch(latest_id, '(RFC822)')
-        
-        for response_part in msg_data:
-            if isinstance(response_part, tuple):
-                msg = email.message_from_bytes(response_part[1])
-                subject = msg['subject'] or ""
-                from_email = msg['from']
-                date = msg['date']
-                
-                print(f"\n⚡ NEW EMAIL DETECTED!")
-                print(f"   📨 Subject: '{subject}'")
-                print(f"   👤 From: {from_email}")
-                print(f"   📅 Date: {date}")
-                
-                # Check if subject matches
-                subject_upper = subject.upper()
-                matched = False
-                for trigger in TRIGGER_SUBJECTS:
-                    if trigger in subject_upper:
-                        print(f"   ✅ MATCH! Found trigger word: '{trigger}'")
-                        matched = True
-                        trigger_jenkins()
-                        break
-                
-                if not matched:
-                    print(f"   ⏭️  No trigger word found. Skipping.")
-                    print(f"   💡 Trigger words: {TRIGGER_SUBJECTS}")
-                
-    except Exception as e:
-        print(f"❌ Error checking email: {e}")
-
-def idle_monitor():
-    """Monitor Gmail using IDLE - waits for new emails"""
-    global monitoring
-    
-    print("🔌 Connecting to Gmail IMAP...")
-    
-    while monitoring:
-        try:
-            # Connect
-            mail = imaplib.IMAP4_SSL('imap.gmail.com')
-            mail.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
-            mail.select('inbox')
-            
-            print("✅ Connected to Gmail IMAP successfully")
-            print("👀 IDLE mode activated - waiting for emails...")
-            print("   💡 The script will wake up INSTANTLY when email arrives!\n")
-            
-            while monitoring:
-                # Start IDLE mode
-                tag = b'A001'
-                mail.send(b'%s IDLE\r\n' % tag)
-                
-                # Wait for response (blocks here until email arrives)
-                while True:
-                    line = mail.readline()
-                    
-                    if b'EXISTS' in line:
-                        # NEW EMAIL ARRIVED!
-                        print("\n🔔 DING! Email notification received!")
-                        
-                        # Exit IDLE
-                        mail.send(b'DONE\r\n')
-                        # Clear buffer
-                        while True:
-                            resp = mail.readline()
-                            if b'OK' in resp or b'IDLE' in resp:
-                                break
-                        
-                        # Check the email
-                        check_latest_email(mail)
-                        
-                        print("\n👀 Back to IDLE mode - waiting for next email...\n")
-                        break
-                    
-                    # Timeout after 29 minutes (Gmail IDLE limit)
-                    if b'OK' in line:
-                        # IDLE timed out, restart it
-                        break
-            
-        except Exception as e:
-            print(f"\n❌ Connection error: {e}")
-            print("🔄 Reconnecting in 10 seconds...")
-            time.sleep(10)
-
-@app.route('/health', methods=['GET'])
-def health():
+@app.route("/", methods=["GET"])
+def health_check():
+    """Health check endpoint"""
     return jsonify({
-        'status': 'running' if monitoring else 'stopped',
-        'gmail': GMAIL_EMAIL,
-        'jenkins': JENKINS_URL,
-        'job': JOB_NAME,
-        'triggers': TRIGGER_SUBJECTS
-    }), 200
+        "status": "healthy",
+        "service": "gmail-jenkins-webhook",
+        "timestamp": datetime.utcnow().isoformat()
+    })
 
-@app.route('/test-jenkins', methods=['POST'])
-def test_jenkins():
-    """Manually test Jenkins trigger"""
-    print("\n🧪 Manual Jenkins test triggered...")
-    if trigger_jenkins():
-        return jsonify({'status': 'success', 'message': 'Jenkins triggered'}), 200
-    else:
-        return jsonify({'status': 'failed', 'message': 'Jenkins trigger failed'}), 500
 
-@app.route('/stop', methods=['POST'])
-def stop():
-    global monitoring
-    monitoring = False
-    return jsonify({'status': 'stopping'}), 200
-
-if __name__ == '__main__':
-    print("\n" + "="*70)
-    print("⚡ INSTANT Gmail-to-Jenkins Trigger (IMAP IDLE)")
-    print("="*70)
-    print(f"📧 Gmail: {GMAIL_EMAIL}")
-    print(f"🎯 Jenkins: {JENKINS_URL}")
-    print(f"👤 User: {JENKINS_USER}")
-    print(f"📋 Job: '{JOB_NAME}'")
-    print(f"🔑 Triggers: {TRIGGER_SUBJECTS}")
-    print("="*70)
-    print("\n💡 HOW TO TEST:")
-    print("   1. Send email to natarajan@pdevsecops.com")
-    print("   2. Subject must contain: TRIGGER (or any trigger word)")
-    print("   3. Watch this terminal - it will trigger INSTANTLY!")
-    print("\n🌐 API Endpoints:")
-    print("   Health: http://localhost:5000/health")
-    print("   Test Jenkins: POST to http://localhost:5000/test-jenkins")
-    print("\n")
+@app.route("/gmail-webhook", methods=["POST"])
+def gmail_webhook():
+    """
+    Main webhook endpoint
+    Receives email data from Google Apps Script
+    Validates subject and triggers Jenkins
+    """
+    try:
+        # Parse JSON data
+        data = request.get_json()
+        
+        if not data:
+            logger.warning("Received empty request body")
+            return jsonify({"error": "No data received"}), 400
+        
+        # Extract email details
+        subject = data.get("subject", "")
+        from_email = data.get("from", "unknown")
+        message_id = data.get("messageId", "unknown")
+        
+        logger.info(f"Received email - Subject: '{subject}' | From: {from_email}")
+        
+        # Validate subject contains trigger keyword
+        if "Practical DevSecOps" in subject:
+            logger.info(f"✓ Subject matched! Triggering Jenkins job...")
+            
+            # Trigger Jenkins job
+            jenkins_response = trigger_jenkins_job(data)
+            
+            if jenkins_response["success"]:
+                logger.info(f"✓ Jenkins job triggered successfully")
+                return jsonify({
+                    "status": "success",
+                    "message": "Jenkins job triggered",
+                    "jenkins_response": jenkins_response
+                }), 200
+            else:
+                logger.error(f"✗ Jenkins trigger failed: {jenkins_response['error']}")
+                return jsonify({
+                    "status": "error",
+                    "message": "Failed to trigger Jenkins",
+                    "details": jenkins_response
+                }), 500
+        
+        else:
+            logger.info(f"✗ Subject did not match - ignoring email")
+            return jsonify({
+                "status": "ignored",
+                "message": "Email subject did not match trigger keyword"
+            }), 200
     
-    # Start IDLE monitor in background
-    monitor_thread = threading.Thread(target=idle_monitor, daemon=True)
-    monitor_thread.start()
+    except Exception as e:
+        logger.error(f"Error processing webhook: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+
+def trigger_jenkins_job(email_data):
+    """
+    Trigger Jenkins job via REST API
     
-    # Start Flask
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    Args:
+        email_data: Dictionary with email details
+        
+    Returns:
+        Dictionary with success status and details
+    """
+    try:
+        # Prepare Jenkins request
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        # Optional: Pass email data as parameters to Jenkins
+        # params = {
+        #     "EMAIL_SUBJECT": email_data.get("subject", ""),
+        #     "EMAIL_FROM": email_data.get("from", "")
+        # }
+        
+        # Make request to Jenkins
+        response = requests.post(
+            JENKINS_URL,
+            auth=(JENKINS_USER, JENKINS_API_TOKEN),
+            headers=headers,
+            # json=params,  # Uncomment to pass parameters
+            timeout=10
+        )
+        
+        # Check response
+        if response.status_code in [200, 201]:
+            return {
+                "success": True,
+                "status_code": response.status_code,
+                "message": "Jenkins job triggered successfully"
+            }
+        else:
+            return {
+                "success": False,
+                "status_code": response.status_code,
+                "error": response.text,
+                "message": "Jenkins returned non-success status"
+            }
+    
+    except requests.exceptions.Timeout:
+        return {
+            "success": False,
+            "error": "Request to Jenkins timed out",
+            "message": "Jenkins may be slow or unreachable"
+        }
+    
+    except requests.exceptions.ConnectionError:
+        return {
+            "success": False,
+            "error": "Could not connect to Jenkins",
+            "message": "Check Jenkins URL and network connectivity"
+        }
+    
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "Unexpected error triggering Jenkins"
+        }
+
+
+@app.route("/test", methods=["POST"])
+def test_endpoint():
+    """
+    Test endpoint - manually trigger Jenkins without email validation
+    Usage: curl -X POST http://server:5000/test
+    """
+    logger.info("Test endpoint called - triggering Jenkins directly")
+    
+    test_data = {
+        "subject": "Test trigger",
+        "from": "test@example.com",
+        "messageId": "test-123"
+    }
+    
+    result = trigger_jenkins_job(test_data)
+    
+    return jsonify({
+        "status": "test",
+        "jenkins_result": result
+    })
+
+
+if __name__ == "__main__":
+    logger.info("=" * 50)
+    logger.info("Gmail-Jenkins Webhook Server Starting")
+    logger.info(f"Jenkins URL: {JENKINS_URL}")
+    logger.info(f"Jenkins User: {JENKINS_USER}")
+    logger.info(f"Listening on port: {FLASK_PORT}")
+    logger.info("=" * 50)
+    
+    app.run(
+        host="0.0.0.0",
+        port=FLASK_PORT,
+        debug=FLASK_DEBUG
+    )
