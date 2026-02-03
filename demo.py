@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 # Initialize Flask app
 app = Flask(__name__)
 
+# Configure for reverse proxy (Coolify, nginx, etc.)
+# This ensures Flask correctly handles requests behind a proxy
+app.config['PREFERRED_URL_SCHEME'] = 'https'
+
 # Load configuration from environment variables
 JENKINS_URL = os.environ.get("JENKINS_URL")
 JENKINS_USER = os.environ.get("JENKINS_USER")
@@ -51,7 +55,8 @@ def health_check():
     })
 
 
-@app.route("/gmail-webhook", methods=["POST"])
+@app.route("/gmail-webhook", methods=["POST", "GET"])
+@app.route("/gmail-webhook/", methods=["POST", "GET"])
 def gmail_webhook():
     """
     Main webhook endpoint
@@ -59,6 +64,19 @@ def gmail_webhook():
     Validates subject and triggers Jenkins
     """
     try:
+        # Log request details for debugging
+        logger.info(f"Request method: {request.method}")
+        logger.info(f"Request path: {request.path}")
+        logger.info(f"Request headers: {dict(request.headers)}")
+        
+        # Handle GET requests (for health checks or debugging)
+        if request.method == "GET":
+            return jsonify({
+                "status": "endpoint_active",
+                "message": "Gmail webhook endpoint is active. Use POST to send data.",
+                "method": request.method
+            }), 200
+        
         # Parse JSON data
         data = request.get_json()
         
@@ -198,6 +216,28 @@ def test_endpoint():
         "status": "test",
         "jenkins_result": result
     })
+
+
+@app.before_request
+def log_request_info():
+    """Log all incoming requests for debugging"""
+    logger.info(f"Incoming request: {request.method} {request.path}")
+    logger.info(f"Headers: {dict(request.headers)}")
+    if request.is_json:
+        logger.info(f"JSON payload: {request.get_json()}")
+
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    """Handle 405 errors with detailed logging"""
+    logger.error(f"405 Method Not Allowed: {request.method} {request.path}")
+    logger.error(f"Allowed methods for {request.path}: {e.valid_methods if hasattr(e, 'valid_methods') else 'unknown'}")
+    return jsonify({
+        "error": "Method not allowed",
+        "method": request.method,
+        "path": request.path,
+        "message": f"{request.method} is not allowed for {request.path}"
+    }), 405
 
 
 if __name__ == "__main__":
