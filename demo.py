@@ -16,6 +16,7 @@ from flask import Flask, request, jsonify
 import requests
 import os
 import logging
+import threading
 from datetime import datetime
 
 # Configure logging
@@ -99,23 +100,21 @@ def gmail_webhook():
         if "Practical DevSecOps" in subject:
             logger.info(f"✓ Subject matched! Triggering Jenkins job...")
             
-            # Trigger Jenkins job
-            jenkins_response = trigger_jenkins_job(data)
+            # Trigger Jenkins job asynchronously to avoid blocking the worker
+            # This prevents gunicorn worker timeouts if Jenkins is slow
+            thread = threading.Thread(
+                target=trigger_jenkins_job_async,
+                args=(data,),
+                daemon=True
+            )
+            thread.start()
             
-            if jenkins_response["success"]:
-                logger.info(f"✓ Jenkins job triggered successfully")
-                return jsonify({
-                    "status": "success",
-                    "message": "Jenkins job triggered",
-                    "jenkins_response": jenkins_response
-                }), 200
-            else:
-                logger.error(f"✗ Jenkins trigger failed: {jenkins_response['error']}")
-                return jsonify({
-                    "status": "error",
-                    "message": "Failed to trigger Jenkins",
-                    "details": jenkins_response
-                }), 500
+            # Return immediately - Jenkins trigger happens in background
+            return jsonify({
+                "status": "accepted",
+                "message": "Jenkins job trigger initiated",
+                "note": "Job is being triggered asynchronously"
+            }), 202
         
         else:
             logger.info(f"✗ Subject did not match - ignoring email")
@@ -130,6 +129,21 @@ def gmail_webhook():
             "status": "error",
             "message": str(e)
         }), 500
+
+
+def trigger_jenkins_job_async(email_data):
+    """
+    Trigger Jenkins job asynchronously (runs in background thread)
+    Logs results but doesn't return anything
+    
+    Args:
+        email_data: Dictionary with email details
+    """
+    result = trigger_jenkins_job(email_data)
+    if result["success"]:
+        logger.info(f"✓ Jenkins job triggered successfully (async)")
+    else:
+        logger.error(f"✗ Jenkins trigger failed (async): {result.get('error', 'Unknown error')}")
 
 
 def trigger_jenkins_job(email_data):

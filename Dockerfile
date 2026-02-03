@@ -32,4 +32,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:5000/ || exit 1
 
 # Run with gunicorn for production
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "30", "--access-logfile", "-", "--error-logfile", "-", "demo:app"]
+# Timeout set to 120s to accommodate slow Jenkins responses (Jenkins timeout is 60s by default)
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "120", "--access-logfile", "-", "--error-logfile", "-", "demo:app"]
