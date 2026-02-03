@@ -433,12 +433,39 @@ def log_startup_info():
 # Log startup info when module is imported (for gunicorn)
 # This runs once when the module is loaded
 # Wrap in try-except to prevent import failures
+def initialize_service():
+    """Initialize and validate service configuration"""
+    try:
+        log_startup_info()
+        
+        # Validate configuration
+        missing = []
+        if not JENKINS_URL:
+            missing.append("JENKINS_URL")
+        if not JENKINS_USER:
+            missing.append("JENKINS_USER")
+        if not JENKINS_API_TOKEN:
+            missing.append("JENKINS_API_TOKEN")
+        
+        if missing:
+            logger.warning(f"⚠️  Service starting with missing configuration: {', '.join(missing)}")
+            logger.warning("Endpoints will return 503 until configuration is complete")
+        else:
+            logger.info("✓ Service initialized successfully with all configuration")
+            
+    except Exception as e:
+        logger.error(f"Error during startup: {e}", exc_info=True)
+        # Don't raise - let the service start even if logging fails
+        logger.warning("Service will continue but may not function correctly")
+
+# Initialize on import (for gunicorn)
+# This ensures the app is ready when gunicorn loads it
 try:
-    log_startup_info()
-    logger.info("Service initialized successfully")
+    initialize_service()
 except Exception as e:
-    logger.error(f"Error during startup: {e}", exc_info=True)
-    # Don't raise - let the service start even if logging fails
+    # Critical: Don't let initialization errors prevent the service from starting
+    logger.error(f"Critical error during initialization: {e}", exc_info=True)
+    logger.error("Service will attempt to start anyway - check configuration")
 
 # Only run Flask dev server if executed directly (not via gunicorn)
 if __name__ == "__main__":

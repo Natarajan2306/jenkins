@@ -28,9 +28,12 @@ USER appuser
 EXPOSE 5000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+# Increased start-period to allow gunicorn workers to fully initialize
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:5000/ || exit 1
 
 # Run with gunicorn for production
 # Timeout set to 120s to accommodate slow Jenkins responses (Jenkins timeout is 60s by default)
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "120", "--access-logfile", "-", "--error-logfile", "-", "demo:app"]
+# Preload app to ensure faster startup and better error handling
+# Graceful timeout for worker restarts
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "120", "--graceful-timeout", "30", "--preload", "--access-logfile", "-", "--error-logfile", "-", "demo:app"]
