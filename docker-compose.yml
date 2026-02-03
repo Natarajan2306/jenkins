@@ -11,7 +11,7 @@ services:
       - JENKINS_API_TOKEN=${JENKINS_API_TOKEN}
       - FLASK_PORT=5000
       - FLASK_DEBUG=False
-      - JENKINS_TIMEOUT=${JENKINS_TIMEOUT:-60}
+      - JENKINS_TIMEOUT=${JENKINS_TIMEOUT:-120}
     volumes:
       # Optional: Mount logs directory
       - ./logs:/app/logs

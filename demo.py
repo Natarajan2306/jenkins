@@ -7,9 +7,9 @@ Environment Variables Required:
 - JENKINS_URL: Full Jenkins job build URL
 - JENKINS_USER: Jenkins username
 - JENKINS_API_TOKEN: Jenkins API token
-- FLASK_PORT: (optional) Port to run on, default 5000
+- PORT or FLASK_PORT: (optional) Port to run on, default 5000 (Coolify uses PORT)
 - FLASK_DEBUG: (optional) Enable debug mode, default False
-- JENKINS_TIMEOUT: (optional) Jenkins request timeout in seconds, default 60
+- JENKINS_TIMEOUT: (optional) Jenkins request timeout in seconds, default 120
 """
 
 from flask import Flask, request, jsonify
@@ -37,9 +37,10 @@ app.config['PREFERRED_URL_SCHEME'] = 'https'
 JENKINS_URL = os.environ.get("JENKINS_URL")
 JENKINS_USER = os.environ.get("JENKINS_USER")
 JENKINS_API_TOKEN = os.environ.get("JENKINS_API_TOKEN")
-FLASK_PORT = int(os.environ.get("FLASK_PORT", "5000"))
+# Coolify uses PORT environment variable, but we also support FLASK_PORT for flexibility
+FLASK_PORT = int(os.environ.get("PORT", os.environ.get("FLASK_PORT", "5000")))
 FLASK_DEBUG = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
-JENKINS_TIMEOUT = int(os.environ.get("JENKINS_TIMEOUT", "60"))  # Default 60 seconds
+JENKINS_TIMEOUT = int(os.environ.get("JENKINS_TIMEOUT", "120"))  # Default 120 seconds (2 minutes)
 
 # Validate required environment variables
 # Note: We don't exit here if running under gunicorn, as it will cause the worker to crash
@@ -54,33 +55,33 @@ if not all([JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN]):
 
 @app.route("/", methods=["GET"])
 def health_check():
-    """Health check endpoint - must always return 200 for service availability"""
+    """
+    Health check endpoint - must always return 200 for service availability
+    This is critical for Coolify and other deployment platforms to know the service is running.
+    Configuration validation happens in the actual endpoints.
+    """
     # Minimal logging for healthchecks to reduce log noise
     logger.debug("Health check requested")
     try:
-        # Verify critical environment variables are set
-        if not all([JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN]):
-            logger.error("Health check failed: Missing required environment variables")
-            return jsonify({
-                "status": "unhealthy",
-                "service": "gmail-jenkins-webhook",
-                "error": "Missing required environment variables",
-                "timestamp": datetime.utcnow().isoformat()
-            }), 503
+        # Always return 200 if service is running
+        # Configuration validation happens in /ready endpoint and webhook handler
+        config_status = "configured" if all([JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN]) else "not_configured"
         
         return jsonify({
             "status": "healthy",
             "service": "gmail-jenkins-webhook",
+            "configuration": config_status,
             "timestamp": datetime.utcnow().isoformat()
         }), 200
     except Exception as e:
         logger.error(f"Health check error: {str(e)}", exc_info=True)
+        # Even on error, return 200 if service is running (let endpoints handle errors)
         return jsonify({
-            "status": "unhealthy",
+            "status": "healthy",
             "service": "gmail-jenkins-webhook",
-            "error": str(e),
+            "warning": str(e),
             "timestamp": datetime.utcnow().isoformat()
-        }), 503
+        }), 200
 
 
 @app.route("/ping", methods=["GET", "POST"])
@@ -252,13 +253,22 @@ def trigger_jenkins_job(email_data):
         # Make request to Jenkins
         # allow_redirects=True to follow 302 redirects that Jenkins may return
         logger.info(f"Sending POST request to Jenkins (timeout: {JENKINS_TIMEOUT}s)...")
+        logger.info(f"Jenkins URL: {JENKINS_URL}")
+        logger.info(f"Jenkins User: {JENKINS_USER}")
+        
+        # Use a connection timeout and read timeout separately
+        # Connection timeout: how long to wait to establish connection
+        # Read timeout: how long to wait for response after connection
+        connect_timeout = min(10, JENKINS_TIMEOUT // 4)  # 10s or 1/4 of total timeout
+        read_timeout = JENKINS_TIMEOUT
+        
         response = requests.post(
             JENKINS_URL,
             auth=(JENKINS_USER, JENKINS_API_TOKEN),
             headers=headers,
             allow_redirects=True,  # Follow redirects (Jenkins may return 302)
             # json=params,  # Uncomment to pass parameters
-            timeout=JENKINS_TIMEOUT
+            timeout=(connect_timeout, read_timeout)  # (connect, read) timeout tuple
         )
         logger.info(f"Jenkins responded with status code: {response.status_code}")
         logger.info(f"Jenkins response headers: {dict(response.headers)}")
@@ -287,18 +297,24 @@ def trigger_jenkins_job(email_data):
                 "message": f"Jenkins returned status {response.status_code}"
             }
     
-    except requests.exceptions.Timeout:
+    except requests.exceptions.Timeout as e:
+        timeout_type = "read" if "Read" in str(type(e)) else "connection"
+        logger.error(f"✗ Jenkins request timed out ({timeout_type} timeout after {JENKINS_TIMEOUT}s)")
+        logger.error(f"Jenkins URL: {JENKINS_URL}")
         return {
             "success": False,
-            "error": "Request to Jenkins timed out",
-            "message": "Jenkins may be slow or unreachable"
+            "error": f"Request to Jenkins timed out ({timeout_type} timeout)",
+            "timeout_seconds": JENKINS_TIMEOUT,
+            "message": "Jenkins may be slow, unreachable, or the job queue is full"
         }
     
-    except requests.exceptions.ConnectionError:
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"✗ Could not connect to Jenkins: {str(e)}")
+        logger.error(f"Jenkins URL: {JENKINS_URL}")
         return {
             "success": False,
-            "error": "Could not connect to Jenkins",
-            "message": "Check Jenkins URL and network connectivity"
+            "error": f"Could not connect to Jenkins: {str(e)}",
+            "message": "Check Jenkins URL, network connectivity, and firewall settings"
         }
     
     except Exception as e:
