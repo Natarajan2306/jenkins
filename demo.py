@@ -102,12 +102,15 @@ def gmail_webhook():
             
             # Trigger Jenkins job asynchronously to avoid blocking the worker
             # This prevents gunicorn worker timeouts if Jenkins is slow
+            logger.info(f"Creating async thread to trigger Jenkins job...")
             thread = threading.Thread(
                 target=trigger_jenkins_job_async,
                 args=(data,),
-                daemon=True
+                daemon=True,
+                name=f"JenkinsTrigger-{message_id}"
             )
             thread.start()
+            logger.info(f"Async thread started for Jenkins trigger (thread: {thread.name})")
             
             # Return immediately - Jenkins trigger happens in background
             return jsonify({
@@ -139,11 +142,15 @@ def trigger_jenkins_job_async(email_data):
     Args:
         email_data: Dictionary with email details
     """
-    result = trigger_jenkins_job(email_data)
-    if result["success"]:
-        logger.info(f"✓ Jenkins job triggered successfully (async)")
-    else:
-        logger.error(f"✗ Jenkins trigger failed (async): {result.get('error', 'Unknown error')}")
+    try:
+        logger.info(f"Starting async Jenkins trigger for email: {email_data.get('messageId', 'unknown')}")
+        result = trigger_jenkins_job(email_data)
+        if result["success"]:
+            logger.info(f"✓ Jenkins job triggered successfully (async) - Status: {result.get('status_code', 'N/A')}")
+        else:
+            logger.error(f"✗ Jenkins trigger failed (async): {result.get('error', 'Unknown error')} - Status: {result.get('status_code', 'N/A')}")
+    except Exception as e:
+        logger.error(f"✗ Exception in async Jenkins trigger: {str(e)}", exc_info=True)
 
 
 def trigger_jenkins_job(email_data):
@@ -157,10 +164,11 @@ def trigger_jenkins_job(email_data):
         Dictionary with success status and details
     """
     try:
+        logger.info(f"Preparing Jenkins request to: {JENKINS_URL}")
         # Prepare Jenkins request
-        headers = {
-            "Content-Type": "application/json"
-        }
+        # Note: Jenkins build trigger typically doesn't need Content-Type header
+        # Some Jenkins instances may reject requests with Content-Type: application/json
+        headers = {}
         
         # Optional: Pass email data as parameters to Jenkins
         # params = {
@@ -169,27 +177,41 @@ def trigger_jenkins_job(email_data):
         # }
         
         # Make request to Jenkins
+        # allow_redirects=True to follow 302 redirects that Jenkins may return
+        logger.info(f"Sending POST request to Jenkins (timeout: {JENKINS_TIMEOUT}s)...")
         response = requests.post(
             JENKINS_URL,
             auth=(JENKINS_USER, JENKINS_API_TOKEN),
             headers=headers,
+            allow_redirects=True,  # Follow redirects (Jenkins may return 302)
             # json=params,  # Uncomment to pass parameters
             timeout=JENKINS_TIMEOUT
         )
+        logger.info(f"Jenkins responded with status code: {response.status_code}")
+        logger.info(f"Jenkins response headers: {dict(response.headers)}")
         
-        # Check response
-        if response.status_code in [200, 201]:
+        # Jenkins can return various status codes for successful triggers:
+        # - 200: OK (some Jenkins versions)
+        # - 201: Created (standard success)
+        # - 302: Redirect (also indicates success, redirects to queue/item page)
+        # - 303: See Other (also indicates success)
+        if response.status_code in [200, 201, 302, 303]:
+            location = response.headers.get('Location', 'N/A')
+            logger.info(f"✓ Jenkins job triggered successfully - Location: {location}")
             return {
                 "success": True,
                 "status_code": response.status_code,
+                "location": location,
                 "message": "Jenkins job triggered successfully"
             }
         else:
+            error_text = response.text[:500] if response.text else "No response body"
+            logger.error(f"✗ Jenkins returned non-success status {response.status_code}: {error_text}")
             return {
                 "success": False,
                 "status_code": response.status_code,
-                "error": response.text,
-                "message": "Jenkins returned non-success status"
+                "error": error_text,
+                "message": f"Jenkins returned status {response.status_code}"
             }
     
     except requests.exceptions.Timeout:
