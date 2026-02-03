@@ -42,22 +42,45 @@ FLASK_DEBUG = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
 JENKINS_TIMEOUT = int(os.environ.get("JENKINS_TIMEOUT", "60"))  # Default 60 seconds
 
 # Validate required environment variables
+# Note: We don't exit here if running under gunicorn, as it will cause the worker to crash
+# Instead, we check in the health endpoint and webhook handler
 if not all([JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN]):
     logger.error("Missing required environment variables!")
     logger.error("Required: JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN")
-    exit(1)
+    logger.warning("Service will start but endpoints will return 503 until configured")
+    # Don't exit - let the service start and return 503 from endpoints
+    # This allows health checks to work and helps with debugging
 
 
 @app.route("/", methods=["GET"])
 def health_check():
-    """Health check endpoint"""
+    """Health check endpoint - must always return 200 for service availability"""
     # Minimal logging for healthchecks to reduce log noise
     logger.debug("Health check requested")
-    return jsonify({
-        "status": "healthy",
-        "service": "gmail-jenkins-webhook",
-        "timestamp": datetime.utcnow().isoformat()
-    })
+    try:
+        # Verify critical environment variables are set
+        if not all([JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN]):
+            logger.error("Health check failed: Missing required environment variables")
+            return jsonify({
+                "status": "unhealthy",
+                "service": "gmail-jenkins-webhook",
+                "error": "Missing required environment variables",
+                "timestamp": datetime.utcnow().isoformat()
+            }), 503
+        
+        return jsonify({
+            "status": "healthy",
+            "service": "gmail-jenkins-webhook",
+            "timestamp": datetime.utcnow().isoformat()
+        }), 200
+    except Exception as e:
+        logger.error(f"Health check error: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "unhealthy",
+            "service": "gmail-jenkins-webhook",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }), 503
 
 
 @app.route("/ping", methods=["GET", "POST"])
@@ -67,6 +90,40 @@ def ping():
         "status": "pong",
         "timestamp": datetime.utcnow().isoformat()
     }), 200
+
+
+@app.route("/ready", methods=["GET"])
+def readiness_check():
+    """Readiness check endpoint - verifies service is ready to accept requests"""
+    try:
+        # Check all required configuration
+        missing = []
+        if not JENKINS_URL:
+            missing.append("JENKINS_URL")
+        if not JENKINS_USER:
+            missing.append("JENKINS_USER")
+        if not JENKINS_API_TOKEN:
+            missing.append("JENKINS_API_TOKEN")
+        
+        if missing:
+            logger.warning(f"Readiness check failed: Missing {', '.join(missing)}")
+            return jsonify({
+                "status": "not_ready",
+                "missing": missing,
+                "timestamp": datetime.utcnow().isoformat()
+            }), 503
+        
+        return jsonify({
+            "status": "ready",
+            "timestamp": datetime.utcnow().isoformat()
+        }), 200
+    except Exception as e:
+        logger.error(f"Readiness check error: {str(e)}", exc_info=True)
+        return jsonify({
+            "status": "not_ready",
+            "error": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }), 503
 
 
 @app.route("/gmail-webhook", methods=["POST", "GET"])
@@ -79,6 +136,14 @@ def gmail_webhook():
     """
     # Log immediately to confirm request reached handler
     logger.info(f"✓ Webhook handler called: {request.method} {request.path}")
+    
+    # Verify service is ready
+    if not all([JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN]):
+        logger.error("Service not ready: Missing required environment variables")
+        return jsonify({
+            "status": "error",
+            "message": "Service not ready - missing configuration"
+        }), 503
     
     try:
         # Handle GET requests first (for health checks or debugging) - return immediately
@@ -365,22 +430,26 @@ def log_startup_info():
     logger.info("=" * 50)
 
 
+# Log startup info when module is imported (for gunicorn)
+# This runs once when the module is loaded
+# Wrap in try-except to prevent import failures
+try:
+    log_startup_info()
+    logger.info("Service initialized successfully")
+except Exception as e:
+    logger.error(f"Error during startup: {e}", exc_info=True)
+    # Don't raise - let the service start even if logging fails
+
+# Only run Flask dev server if executed directly (not via gunicorn)
 if __name__ == "__main__":
     logger.info("=" * 50)
-    logger.info("Gmail-Jenkins Webhook Server Starting")
+    logger.info("Gmail-Jenkins Webhook Server Starting (Development Mode)")
     logger.info(f"Jenkins URL: {JENKINS_URL}")
     logger.info(f"Jenkins User: {JENKINS_USER}")
     logger.info(f"Listening on port: {FLASK_PORT}")
-    log_startup_info()
     
     app.run(
         host="0.0.0.0",
         port=FLASK_PORT,
         debug=FLASK_DEBUG
     )
-# When imported by gunicorn, log startup info
-# Routes are registered via decorators, so they're available at import time
-try:
-    log_startup_info()
-except Exception as e:
-    logger.warning(f"Could not log startup info: {e}")
