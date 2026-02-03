@@ -60,6 +60,15 @@ def health_check():
     })
 
 
+@app.route("/ping", methods=["GET", "POST"])
+def ping():
+    """Quick ping endpoint to test connectivity"""
+    return jsonify({
+        "status": "pong",
+        "timestamp": datetime.utcnow().isoformat()
+    }), 200
+
+
 @app.route("/gmail-webhook", methods=["POST", "GET"])
 @app.route("/gmail-webhook/", methods=["POST", "GET"])
 def gmail_webhook():
@@ -68,13 +77,11 @@ def gmail_webhook():
     Receives email data from Google Apps Script
     Validates subject and triggers Jenkins
     """
+    # Log immediately to confirm request reached handler
+    logger.info(f"✓ Webhook handler called: {request.method} {request.path}")
+    
     try:
-        # Log request details for debugging
-        logger.info(f"Request method: {request.method}")
-        logger.info(f"Request path: {request.path}")
-        logger.info(f"Request headers: {dict(request.headers)}")
-        
-        # Handle GET requests (for health checks or debugging)
+        # Handle GET requests first (for health checks or debugging) - return immediately
         if request.method == "GET":
             return jsonify({
                 "status": "endpoint_active",
@@ -82,7 +89,7 @@ def gmail_webhook():
                 "method": request.method
             }), 200
         
-        # Parse JSON data
+        # Parse JSON data first (before heavy logging)
         data = request.get_json()
         
         if not data:
@@ -94,7 +101,7 @@ def gmail_webhook():
         from_email = data.get("from", "unknown")
         message_id = data.get("messageId", "unknown")
         
-        logger.info(f"Received email - Subject: '{subject}' | From: {from_email}")
+        logger.info(f"Received email - Subject: '{subject}' | From: {from_email} | ID: {message_id}")
         
         # Validate subject contains trigger keyword
         if "Practical DevSecOps" in subject:
@@ -102,7 +109,6 @@ def gmail_webhook():
             
             # Trigger Jenkins job asynchronously to avoid blocking the worker
             # This prevents gunicorn worker timeouts if Jenkins is slow
-            logger.info(f"Creating async thread to trigger Jenkins job...")
             thread = threading.Thread(
                 target=trigger_jenkins_job_async,
                 args=(data,),
@@ -113,11 +119,13 @@ def gmail_webhook():
             logger.info(f"Async thread started for Jenkins trigger (thread: {thread.name})")
             
             # Return immediately - Jenkins trigger happens in background
-            return jsonify({
+            # This must return quickly to avoid proxy timeouts
+            response = jsonify({
                 "status": "accepted",
                 "message": "Jenkins job trigger initiated",
                 "note": "Job is being triggered asynchronously"
-            }), 202
+            })
+            return response, 202
         
         else:
             logger.info(f"✗ Subject did not match - ignoring email")
@@ -266,6 +274,13 @@ def log_request_info():
         logger.debug(f"Healthcheck: {request.method} {request.path}")
         return
     
+    # For webhook endpoints, log minimal info to avoid blocking
+    # Full logging will happen in the handler after we start processing
+    if request.path.startswith("/gmail-webhook"):
+        logger.info(f"Webhook request: {request.method} {request.path}")
+        return  # Don't do heavy logging here - return immediately
+    
+    # For other endpoints, do full logging
     logger.info(f"Incoming request: {request.method} {request.path}")
     logger.info(f"Request URL: {request.url}")
     logger.info(f"Request base URL: {request.base_url}")
