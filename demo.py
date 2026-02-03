@@ -17,6 +17,7 @@ import requests
 import os
 import logging
 import threading
+import json
 from datetime import datetime
 
 # Configure logging
@@ -134,78 +135,103 @@ def gmail_webhook():
     Main webhook endpoint
     Receives email data from Google Apps Script
     Validates subject and triggers Jenkins
-    """
-    # Log immediately to confirm request reached handler
-    logger.info(f"✓ Webhook handler called: {request.method} {request.path}")
     
-    # Verify service is ready
+    CRITICAL: This endpoint must return IMMEDIATELY (< 1 second) to avoid 504 timeouts.
+    All processing happens asynchronously in a background thread.
+    """
+    # Handle GET requests immediately (for health checks or debugging)
+    if request.method == "GET":
+        return jsonify({
+            "status": "endpoint_active",
+            "message": "Gmail webhook endpoint is active. Use POST to send data.",
+            "method": request.method
+        }), 200
+    
+    # For POST: Return 202 Accepted IMMEDIATELY, process in background
+    # This prevents 504 Gateway Timeout errors from proxies/load balancers
+    
+    # Verify service is ready (quick check)
     if not all([JENKINS_URL, JENKINS_USER, JENKINS_API_TOKEN]):
-        logger.error("Service not ready: Missing required environment variables")
         return jsonify({
             "status": "error",
             "message": "Service not ready - missing configuration"
         }), 503
     
+    # Get raw request data to pass to background thread
+    # Don't parse JSON here - do it in the background thread to save time
     try:
-        # Handle GET requests first (for health checks or debugging) - return immediately
-        if request.method == "GET":
-            return jsonify({
-                "status": "endpoint_active",
-                "message": "Gmail webhook endpoint is active. Use POST to send data.",
-                "method": request.method
-            }), 200
+        raw_data = request.get_data(as_text=True)
+    except Exception as e:
+        logger.error(f"Error reading request data: {str(e)}")
+        raw_data = None
+    
+    # Start background processing immediately
+    # All JSON parsing, validation, and Jenkins triggering happens in background
+    thread = threading.Thread(
+        target=process_webhook_async,
+        args=(raw_data,),
+        daemon=True,
+        name=f"WebhookProcessor-{datetime.utcnow().isoformat()}"
+    )
+    thread.start()
+    
+    # Return 202 Accepted immediately - processing happens in background
+    # This response must be sent within milliseconds to avoid proxy timeouts
+    return jsonify({
+        "status": "accepted",
+        "message": "Webhook received and queued for processing",
+        "note": "Processing happens asynchronously"
+    }), 202
+
+
+def process_webhook_async(raw_data):
+    """
+    Process webhook request asynchronously (runs in background thread)
+    This does all the heavy lifting: JSON parsing, validation, Jenkins triggering
+    
+    Args:
+        raw_data: Raw request body as string (will be parsed as JSON)
+    """
+    try:
+        logger.info("Starting async webhook processing...")
         
-        # Parse JSON data first (before heavy logging)
-        data = request.get_json()
+        # Parse JSON data
+        if not raw_data:
+            logger.warning("Received empty request body in async processor")
+            return
         
-        if not data:
-            logger.warning("Received empty request body")
-            return jsonify({"error": "No data received"}), 400
+        try:
+            data = json.loads(raw_data)
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse JSON in async processor: {str(e)}")
+            return
+        except Exception as e:
+            logger.error(f"Error parsing request data: {str(e)}")
+            return
         
         # Extract email details
         subject = data.get("subject", "")
         from_email = data.get("from", "unknown")
         message_id = data.get("messageId", "unknown")
         
-        logger.info(f"Received email - Subject: '{subject}' | From: {from_email} | ID: {message_id}")
+        logger.info(f"Processing email - Subject: '{subject}' | From: {from_email} | ID: {message_id}")
         
         # Validate subject contains trigger keyword
         if "Practical DevSecOps" in subject:
             logger.info(f"✓ Subject matched! Triggering Jenkins job...")
             
-            # Trigger Jenkins job asynchronously to avoid blocking the worker
-            # This prevents gunicorn worker timeouts if Jenkins is slow
-            thread = threading.Thread(
-                target=trigger_jenkins_job_async,
-                args=(data,),
-                daemon=True,
-                name=f"JenkinsTrigger-{message_id}"
-            )
-            thread.start()
-            logger.info(f"Async thread started for Jenkins trigger (thread: {thread.name})")
+            # Trigger Jenkins job (this is already async-safe)
+            result = trigger_jenkins_job(data)
             
-            # Return immediately - Jenkins trigger happens in background
-            # This must return quickly to avoid proxy timeouts
-            response = jsonify({
-                "status": "accepted",
-                "message": "Jenkins job trigger initiated",
-                "note": "Job is being triggered asynchronously"
-            })
-            return response, 202
-        
+            if result["success"]:
+                logger.info(f"✓ Jenkins job triggered successfully (async) - Status: {result.get('status_code', 'N/A')}")
+            else:
+                logger.error(f"✗ Jenkins trigger failed (async): {result.get('error', 'Unknown error')} - Status: {result.get('status_code', 'N/A')}")
         else:
             logger.info(f"✗ Subject did not match - ignoring email")
-            return jsonify({
-                "status": "ignored",
-                "message": "Email subject did not match trigger keyword"
-            }), 200
     
     except Exception as e:
-        logger.error(f"Error processing webhook: {str(e)}", exc_info=True)
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
+        logger.error(f"Error in async webhook processing: {str(e)}", exc_info=True)
 
 
 def trigger_jenkins_job_async(email_data):
@@ -237,6 +263,14 @@ def trigger_jenkins_job(email_data):
     Returns:
         Dictionary with success status and details
     """
+    # Define timeouts before try block so they're accessible in exception handler
+    # Use a connection timeout and read timeout separately
+    # Connection timeout: how long to wait to establish connection
+    # Read timeout: how long to wait for response after connection
+    # Increased connection timeout to 30s to handle slow networks/SSL handshakes
+    connect_timeout = min(30, JENKINS_TIMEOUT // 2)  # 30s or 1/2 of total timeout
+    read_timeout = JENKINS_TIMEOUT
+    
     try:
         logger.info(f"Preparing Jenkins request to: {JENKINS_URL}")
         # Prepare Jenkins request
@@ -255,12 +289,7 @@ def trigger_jenkins_job(email_data):
         logger.info(f"Sending POST request to Jenkins (timeout: {JENKINS_TIMEOUT}s)...")
         logger.info(f"Jenkins URL: {JENKINS_URL}")
         logger.info(f"Jenkins User: {JENKINS_USER}")
-        
-        # Use a connection timeout and read timeout separately
-        # Connection timeout: how long to wait to establish connection
-        # Read timeout: how long to wait for response after connection
-        connect_timeout = min(10, JENKINS_TIMEOUT // 4)  # 10s or 1/4 of total timeout
-        read_timeout = JENKINS_TIMEOUT
+        logger.info(f"Connection timeout: {connect_timeout}s, Read timeout: {read_timeout}s")
         
         response = requests.post(
             JENKINS_URL,
@@ -298,14 +327,28 @@ def trigger_jenkins_job(email_data):
             }
     
     except requests.exceptions.Timeout as e:
-        timeout_type = "read" if "Read" in str(type(e)) else "connection"
-        logger.error(f"✗ Jenkins request timed out ({timeout_type} timeout after {JENKINS_TIMEOUT}s)")
-        logger.error(f"Jenkins URL: {JENKINS_URL}")
+        # Determine if it's a connection or read timeout
+        error_str = str(e)
+        if "ConnectTimeout" in error_str or "connection" in error_str.lower():
+            timeout_type = "connection"
+            timeout_value = connect_timeout
+            error_msg = f"Could not establish connection to Jenkins within {timeout_value}s"
+        else:
+            timeout_type = "read"
+            timeout_value = read_timeout
+            error_msg = f"Jenkins did not respond within {timeout_value}s after connection"
+        
+        logger.error(f"✗ Jenkins request timed out ({timeout_type} timeout)")
+        logger.error(f"  Timeout value: {timeout_value}s")
+        logger.error(f"  Jenkins URL: {JENKINS_URL}")
+        logger.error(f"  Error details: {error_str}")
+        
         return {
             "success": False,
-            "error": f"Request to Jenkins timed out ({timeout_type} timeout)",
-            "timeout_seconds": JENKINS_TIMEOUT,
-            "message": "Jenkins may be slow, unreachable, or the job queue is full"
+            "error": error_msg,
+            "timeout_type": timeout_type,
+            "timeout_seconds": timeout_value,
+            "message": "Check Jenkins server status, network connectivity, and firewall settings"
         }
     
     except requests.exceptions.ConnectionError as e:
